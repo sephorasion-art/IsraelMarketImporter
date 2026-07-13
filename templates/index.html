@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Israel Market Importer</title>
+
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+
+<body class="bg-light">
+
+<div class="container mt-5">
+
+    <div class="card shadow">
+
+        <div class="card-body">
+
+            <h1>🇮🇱 Israel Market Importer</h1>
+
+            <p>Importer automatiquement des produits vers Shopify</p>
+
+            <form action="/importer" method="post">
+
+                <div class="mb-3">
+
+                    <label class="form-label">
+                        URL de la catégorie
+                    </label>
+
+                    <input
+                        type="text"
+                        name="url"
+                        class="form-control"
+                        placeholder="https://..."
+                        value="{{ url if url else '' }}"
+                        required
+                    >
+
+                </div>
+
+                <button class="btn btn-primary">
+                    🚀 Importer
+                </button>
+
+            </form>
+
+            {% if message %}
+
+            <div class="alert alert-success mt-4">
+                {{ message }}
+            </div>
+
+            {% endif %}
+
+        </div>
+
+    </div>
+
+</div>
+
+</body>
+</html>
