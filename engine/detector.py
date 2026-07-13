@@ -1,25 +1,27 @@
 from urllib.parse import urlparse
 
+from engine.html_engine import HtmlEngine
+from engine.playwright_engine import PlaywrightEngine
+
 
 class Detector:
 
-    def detect(self, url: str):
+    def detect(self, url):
 
         host = urlparse(url).netloc.lower()
 
-        if "shopify" in host:
-            return "shopify"
+        javascript_sites = [
+            "yango",
+            "shufersal",
+            "tavlineypereg",
+            "shopify",
+            "wixsite",
+            "magento"
+        ]
 
-        if "woocommerce" in host:
-            return "woocommerce"
+        for site in javascript_sites:
 
-        if "yango" in host:
-            return "playwright"
+            if site in host:
+                return PlaywrightEngine()
 
-        if "tavlineypereg" in host:
-            return "playwright"
-
-        if "shufersal" in host:
-            return "playwright"
-
-        return "html"
+        return HtmlEngine()
