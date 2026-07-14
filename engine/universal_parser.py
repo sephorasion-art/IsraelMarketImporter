@@ -17,6 +17,31 @@ _image_detector = ImageDetector()
 _link_detector = LinkDetector()
 _product_detector = ProductDetector()
 
+_FIELD_WEIGHTS: dict[str, float] = {
+    "title": 0.16,
+    "price": 0.15,
+    "compare_at_price": 0.09,
+    "image": 0.08,
+    "gallery": 0.08,
+    "description": 0.10,
+    "sku": 0.08,
+    "ean": 0.08,
+    "brand": 0.07,
+    "category": 0.06,
+    "stock": 0.08,
+    "tags": 0.07,
+}
+
+_STRATEGY_RELIABILITY: dict[str, float] = {
+    "jsonld": 0.95,
+    "schema": 0.90,
+    "opengraph": 0.75,
+    "meta": 0.65,
+    "api": 0.82,
+    "dom": 0.62,
+    "css": 0.57,
+}
+
 
 def _clean_text(value: str | None) -> str:
     if not value:
@@ -33,7 +58,305 @@ def _normalize_url(url: str, base_url: str = "") -> str:
     return _link_detector.normalize(url, base_url)
 
 
-def _extract_jsonld_data(html: str) -> list[dict[str, Any]]:
+def _as_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        clean = _clean_text(value)
+        return [clean] if clean else []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                clean = _clean_text(item)
+                if clean and clean not in out:
+                    out.append(clean)
+            elif isinstance(item, dict):
+                for key in ("name", "title", "url"):
+                    candidate = item.get(key)
+                    if isinstance(candidate, str):
+                        clean = _clean_text(candidate)
+                        if clean and clean not in out:
+                            out.append(clean)
+                        break
+        return out
+    if isinstance(value, dict):
+        for key in ("name", "title", "url"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                clean = _clean_text(candidate)
+                return [clean] if clean else []
+    return []
+
+
+def _split_tags(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [t for t in (_clean_text(v) for v in value if isinstance(v, str)) if t]
+    if isinstance(value, str):
+        parts = re.split(r"[,;|]", value)
+        tags: list[str] = []
+        for part in parts:
+            tag = _clean_text(part)
+            if tag and tag.lower() not in {t.lower() for t in tags}:
+                tags.append(tag)
+        return tags
+    return []
+
+
+def _to_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text:
+            return None
+        if text in {"in stock", "instock", "available", "available now", "true", "yes"}:
+            return 1
+        if text in {"out of stock", "outofstock", "unavailable", "false", "no"}:
+            return 0
+        match = re.search(r"-?\d+", text)
+        if match:
+            try:
+                return int(match.group(0))
+            except ValueError:
+                return None
+    return None
+
+
+def _extract_sku(text: str) -> str:
+    if not text:
+        return ""
+    match = re.search(r"\b(?:sku|ref|reference|item\s*id)\s*[:#-]?\s*([A-Za-z0-9._-]{3,})\b", text, re.I)
+    return _clean_text(match.group(1)) if match else ""
+
+
+def _extract_ean(text: str) -> str:
+    if not text:
+        return ""
+    match = re.search(r"\b(?:ean|gtin|barcode)\s*[:#-]?\s*(\d{8,14})\b", text, re.I)
+    return _clean_text(match.group(1)) if match else ""
+
+
+def _first_str(raw: dict[str, Any], keys: list[str]) -> str:
+    for key in keys:
+        value = raw.get(key)
+        if isinstance(value, str):
+            clean = _clean_text(value)
+            if clean:
+                return clean
+    return ""
+
+
+def _collect_images(raw: dict[str, Any], base_url: str = "") -> list[str]:
+    values: list[str] = []
+    for key in ("gallery", "images", "image", "thumbnail", "thumbnailUrl"):
+        entries = _as_list(raw.get(key))
+        for entry in entries:
+            normalized = _image_detector.normalize(entry, base_url)
+            if normalized and normalized not in values:
+                values.append(normalized)
+    return values
+
+
+def _normalize_item(raw: dict[str, Any], source: str, base_url: str = "") -> dict[str, Any]:
+    combined_text = " ".join(
+        [
+            _first_str(raw, ["title", "name", "headline", "displayName"]),
+            _first_str(raw, ["description", "subtitle", "summary"]),
+            _first_str(raw, ["category", "categoryName"]),
+            _first_str(raw, ["keywords", "tags_text"]),
+        ]
+    )
+    title = _first_str(raw, ["title", "name", "headline", "displayName"])
+    description = _first_str(raw, ["description", "subtitle", "summary"])
+    url = _normalize_url(_first_str(raw, ["url", "link", "canonical", "productUrl"]), base_url)
+
+    images = _collect_images(raw, base_url)
+    price = _parse_price(str(raw.get("price") or raw.get("currentPrice") or raw.get("salePrice") or ""))
+    if price is None and description:
+        price = _price_detector.detect_in_text(description)
+
+    compare_at_price = _parse_price(
+        str(
+            raw.get("compare_at_price")
+            or raw.get("old_price")
+            or raw.get("listPrice")
+            or raw.get("msrp")
+            or raw.get("highPrice")
+            or ""
+        )
+    )
+
+    sku = _first_str(raw, ["sku", "productId", "id", "itemId"])
+    if not sku:
+        sku = _extract_sku(combined_text)
+
+    ean = _first_str(raw, ["ean", "gtin", "gtin13", "gtin12", "barcode"])
+    if not ean:
+        ean = _extract_ean(combined_text)
+
+    brand = _first_str(raw, ["brand", "manufacturer"])
+    category = _first_str(raw, ["category", "categoryName"])
+
+    stock = _to_int(raw.get("stock"))
+    if stock is None:
+        stock = _to_int(raw.get("availability"))
+
+    tags = _split_tags(raw.get("tags") or raw.get("keywords") or raw.get("tag"))
+
+    return {
+        "title": title,
+        "price": price,
+        "compare_at_price": compare_at_price,
+        "currency": _first_str(raw, ["currency", "priceCurrency"]),
+        "image": images[0] if images else "",
+        "images": images,
+        "gallery": images,
+        "description": description,
+        "sku": sku,
+        "ean": ean,
+        "barcode": ean,
+        "brand": brand,
+        "category": category,
+        "stock": stock,
+        "tags": tags,
+        "url": url,
+        "source": source,
+    }
+
+
+def _has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        return len(value) > 0
+    return True
+
+
+def _score_item(item: dict[str, Any], source: str) -> tuple[float, dict[str, float]]:
+    reliability = _STRATEGY_RELIABILITY.get(source, 0.5)
+    denominator = sum(_FIELD_WEIGHTS.values()) or 1.0
+    field_scores: dict[str, float] = {}
+    score = 0.0
+    for field, weight in _FIELD_WEIGHTS.items():
+        present = _has_value(item.get(field))
+        field_score = round(weight * reliability if present else 0.0, 4)
+        field_scores[field] = field_score
+        score += field_score
+    normalized = round(min(score / denominator, 1.0), 4)
+    return normalized, field_scores
+
+
+def _identity_key(item: dict[str, Any]) -> str:
+    title = _clean_text(str(item.get("title") or "")).lower()
+    if title:
+        return f"title:{title}"
+    if item.get("sku"):
+        return f"sku:{str(item['sku']).lower()}"
+    if item.get("ean"):
+        return f"ean:{str(item['ean']).lower()}"
+    if item.get("url"):
+        return f"url:{str(item['url']).lower()}"
+    return "title:"
+
+
+def _merge_items(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not candidates:
+        return []
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        key = _identity_key(candidate)
+        if key in {"title:"}:
+            continue
+        grouped.setdefault(key, []).append(candidate)
+
+    merged: list[dict[str, Any]] = []
+    for items in grouped.values():
+        base = {
+            "title": "",
+            "price": None,
+            "compare_at_price": None,
+            "currency": "",
+            "image": "",
+            "images": [],
+            "gallery": [],
+            "description": "",
+            "sku": "",
+            "ean": "",
+            "barcode": "",
+            "brand": "",
+            "category": "",
+            "stock": None,
+            "tags": [],
+            "url": "",
+            "source": [],
+            "confidence": 0.0,
+            "confidence_by_field": {},
+        }
+
+        best_field_score: dict[str, float] = {field: -1.0 for field in _FIELD_WEIGHTS}
+        galleries: list[str] = []
+        tags: list[str] = []
+
+        for item in items:
+            score = float(item.get("confidence") or 0.0)
+            if score > base["confidence"]:
+                base["confidence"] = score
+
+            source = str(item.get("source") or "")
+            if source and source not in base["source"]:
+                base["source"].append(source)
+
+            field_scores = item.get("confidence_by_field") or {}
+            for field in _FIELD_WEIGHTS:
+                candidate_value = item.get(field)
+                candidate_field_score = float(field_scores.get(field) or 0.0)
+                if _has_value(candidate_value) and candidate_field_score >= best_field_score[field]:
+                    base[field] = candidate_value
+                    best_field_score[field] = candidate_field_score
+
+            for img in item.get("gallery") or []:
+                if img and img not in galleries:
+                    galleries.append(img)
+            for tag in item.get("tags") or []:
+                if tag and tag.lower() not in {t.lower() for t in tags}:
+                    tags.append(tag)
+
+        base["gallery"] = galleries
+        base["images"] = galleries
+        if not base.get("image") and galleries:
+            base["image"] = galleries[0]
+        base["tags"] = tags
+        base["barcode"] = str(base.get("ean") or base.get("barcode") or "")
+
+        best_for_non_weighted = sorted(items, key=lambda i: float(i.get("confidence") or 0.0), reverse=True)
+        for candidate in best_for_non_weighted:
+            candidate_url = _clean_text(str(candidate.get("url") or ""))
+            if candidate_url:
+                base["url"] = candidate_url
+                break
+        for candidate in best_for_non_weighted:
+            candidate_currency = _clean_text(str(candidate.get("currency") or ""))
+            if candidate_currency:
+                base["currency"] = candidate_currency
+                break
+
+        base["source"] = ",".join(base["source"])
+        base["confidence_by_field"] = {k: round(max(v, 0.0), 4) for k, v in best_field_score.items()}
+        merged.append(base)
+
+    merged.sort(key=lambda i: float(i.get("confidence") or 0.0), reverse=True)
+    return merged
+
+
+def _extract_jsonld_data(html: str, base_url: str = "") -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "lxml")
     products = []
 
@@ -56,16 +379,26 @@ def _extract_jsonld_data(html: str) -> list[dict[str, Any]]:
                 item_type = item_type[0]
 
             if isinstance(item_type, str) and item_type.lower() == "product":
+                offers = item.get("offers") if isinstance(item.get("offers"), dict) else {}
+                brand = item.get("brand")
+                if isinstance(brand, dict):
+                    brand = brand.get("name")
                 product = {
-                    "title": _clean_text(item.get("name") or item.get("headline") or ""),
+                    "title": _clean_text(item.get("name") or item.get("headline") or item.get("title") or ""),
                     "description": _clean_text(item.get("description") or ""),
                     "url": item.get("url") or "",
                     "sku": _clean_text(item.get("sku") or ""),
-                    "price": _parse_price(item.get("offers", {}).get("price") if isinstance(item.get("offers"), dict) else item.get("price")),
-                    "currency": item.get("offers", {}).get("priceCurrency") if isinstance(item.get("offers"), dict) else item.get("priceCurrency"),
+                    "ean": _clean_text(item.get("gtin13") or item.get("gtin12") or item.get("gtin") or item.get("barcode") or ""),
+                    "price": _parse_price(str(offers.get("price") or item.get("price") or "")),
+                    "compare_at_price": _parse_price(str(offers.get("highPrice") or item.get("highPrice") or "")),
+                    "currency": offers.get("priceCurrency") or item.get("priceCurrency"),
                     "images": item.get("image") if isinstance(item.get("image"), list) else ([item.get("image")] if item.get("image") else []),
+                    "brand": _clean_text(brand if isinstance(brand, str) else ""),
+                    "category": _clean_text(item.get("category") or ""),
+                    "stock": _to_int(offers.get("availability") or item.get("availability")),
+                    "tags": _split_tags(item.get("keywords") or item.get("tags") or ""),
                 }
-                products.append(product)
+                products.append(_normalize_item(product, source="jsonld", base_url=base_url))
 
     return products
 
@@ -107,25 +440,21 @@ def _extract_application_json_data(html: str) -> list[dict[str, Any]]:
             if not (item.get("name") or item.get("title") or item.get("offers") or item.get("price")):
                 continue
 
-            price = None
-            currency = ""
-            offers = item.get("offers")
-            if isinstance(offers, dict):
-                price = _parse_price(offers.get("price") if offers.get("price") is not None else offers.get("priceCurrency"))
-                currency = offers.get("priceCurrency") or ""
-            else:
-                price = _parse_price(item.get("price"))
-
-            images = item.get("image") if isinstance(item.get("image"), list) else ([item.get("image")] if item.get("image") else [])
-
+            offers = item.get("offers") if isinstance(item.get("offers"), dict) else {}
             product = {
-                "title": _clean_text(item.get("name") or item.get("title") or ""),
-                "description": _clean_text(item.get("description") or ""),
-                "url": item.get("url") or "",
-                "sku": _clean_text(item.get("sku") or ""),
-                "price": price,
-                "currency": currency,
-                "images": images,
+                "title": _clean_text(item.get("name") or item.get("title") or item.get("displayName") or ""),
+                "description": _clean_text(item.get("description") or item.get("subtitle") or ""),
+                "url": item.get("url") or item.get("productUrl") or "",
+                "sku": _clean_text(item.get("sku") or item.get("productId") or item.get("id") or ""),
+                "ean": _clean_text(item.get("ean") or item.get("gtin") or item.get("barcode") or ""),
+                "price": _parse_price(str(offers.get("price") or item.get("price") or item.get("currentPrice") or "")),
+                "compare_at_price": _parse_price(str(item.get("compare_at_price") or item.get("oldPrice") or item.get("listPrice") or "")),
+                "currency": _clean_text(str(offers.get("priceCurrency") or item.get("priceCurrency") or "")),
+                "images": item.get("images") or item.get("image") or item.get("media") or [],
+                "brand": _clean_text(item.get("brand") or item.get("manufacturer") or ""),
+                "category": _clean_text(item.get("category") or item.get("categoryName") or ""),
+                "stock": _to_int(item.get("stock") or item.get("availability")),
+                "tags": item.get("tags") or item.get("keywords") or [],
             }
             products.append(product)
 
@@ -210,12 +539,144 @@ def _extract_schema_microdata_products(soup: BeautifulSoup, base_url: str = "") 
             "url": _link_detector.normalize(link_tag.get("href", ""), base_url) if link_tag else "",
             "sku": _clean_text(sku_tag.get_text(" ", strip=True) if sku_tag else ""),
             "price": _parse_price((price_tag.get("content") if price_tag else "") or (price_tag.get_text(" ", strip=True) if price_tag else "")),
-            "currency": "",
             "images": [_image_detector.normalize(image, base_url)] if image else [],
             "brand": _clean_text(brand_tag.get_text(" ", strip=True) if brand_tag else ""),
+            "ean": _clean_text((card.select_one("[itemprop='gtin13'], [itemprop='gtin12'], [itemprop='gtin'], [itemprop='barcode']") or {}).get_text(" ", strip=True) if card.select_one("[itemprop='gtin13'], [itemprop='gtin12'], [itemprop='gtin'], [itemprop='barcode']") else ""),
+            "stock": _to_int((card.select_one("[itemprop='availability']") or {}).get("content") if card.select_one("[itemprop='availability']") else None),
+            "tags": _split_tags((card.select_one("[itemprop='keywords']") or {}).get_text(" ", strip=True) if card.select_one("[itemprop='keywords']") else ""),
         }
         if product["title"] or product["url"]:
-            products.append(product)
+            products.append(_normalize_item(product, source="schema", base_url=base_url))
+    return products
+
+
+def _extract_opengraph_products(soup: BeautifulSoup, base_url: str = "") -> list[dict[str, Any]]:
+    def get_meta(*keys: str) -> str:
+        for key in keys:
+            node = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key})
+            if node and node.get("content"):
+                value = _clean_text(node.get("content"))
+                if value:
+                    return value
+        return ""
+
+    title = get_meta("og:title", "twitter:title")
+    description = get_meta("og:description", "description", "twitter:description")
+    image = get_meta("og:image", "twitter:image")
+    url = get_meta("og:url", "twitter:url", "canonical")
+    price = _parse_price(get_meta("product:price:amount", "og:price:amount", "price"))
+    compare_at_price = _parse_price(get_meta("product:original_price:amount", "product:old_price:amount", "old_price"))
+    sku = get_meta("product:retailer_item_id", "product:sku", "sku")
+    ean = get_meta("product:ean", "product:gtin", "ean", "barcode")
+    brand = get_meta("product:brand", "brand")
+    category = get_meta("product:category", "category")
+    availability = get_meta("product:availability", "availability")
+    tags = _split_tags(get_meta("article:tag", "keywords"))
+
+    if not any([title, price is not None, image, sku, ean]):
+        return []
+
+    product = _normalize_item(
+        {
+            "title": title,
+            "description": description,
+            "image": image,
+            "url": url,
+            "price": price,
+            "compare_at_price": compare_at_price,
+            "sku": sku,
+            "ean": ean,
+            "brand": brand,
+            "category": category,
+            "stock": availability,
+            "tags": tags,
+        },
+        source="opengraph",
+        base_url=base_url,
+    )
+    return [product]
+
+
+def _extract_meta_products(soup: BeautifulSoup, base_url: str = "") -> list[dict[str, Any]]:
+    metas = soup.find_all("meta")
+    bucket: dict[str, Any] = {}
+    for meta in metas:
+        key = _clean_text(meta.get("name") or meta.get("property") or "").lower()
+        value = _clean_text(meta.get("content") or "")
+        if not key or not value:
+            continue
+        if any(token in key for token in ["title", "product:name"]):
+            bucket.setdefault("title", value)
+        elif any(token in key for token in ["description", "summary"]):
+            bucket.setdefault("description", value)
+        elif any(token in key for token in ["image", "thumbnail"]):
+            bucket.setdefault("image", value)
+        elif "price" in key:
+            if "old" in key or "original" in key or "compare" in key:
+                bucket.setdefault("compare_at_price", value)
+            else:
+                bucket.setdefault("price", value)
+        elif "sku" in key:
+            bucket.setdefault("sku", value)
+        elif any(token in key for token in ["ean", "gtin", "barcode"]):
+            bucket.setdefault("ean", value)
+        elif "brand" in key:
+            bucket.setdefault("brand", value)
+        elif "category" in key:
+            bucket.setdefault("category", value)
+        elif "stock" in key or "availability" in key:
+            bucket.setdefault("stock", value)
+        elif "keyword" in key or "tag" in key:
+            bucket.setdefault("tags", value)
+
+    if not bucket:
+        return []
+    return [_normalize_item(bucket, source="meta", base_url=base_url)]
+
+
+def _extract_css_products(soup: BeautifulSoup, base_url: str = "") -> list[dict[str, Any]]:
+    selectors = [
+        ".product",
+        ".product-card",
+        ".product-item",
+        ".item",
+        ".card",
+        "[class*='product']",
+    ]
+    products: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for selector in selectors:
+        for node in soup.select(selector):
+            title_node = node.select_one("h1, h2, h3, [class*='title'], [itemprop='name']")
+            link_node = node.select_one("a[href]")
+            desc_node = node.select_one("p, [class*='desc'], [itemprop='description']")
+
+            title = _clean_text(title_node.get_text(" ", strip=True) if title_node else "")
+            description = _clean_text(desc_node.get_text(" ", strip=True) if desc_node else node.get_text(" ", strip=True))
+            url = _normalize_url(link_node.get("href") if link_node else "", base_url)
+            price = _price_detector.detect_in_text(description)
+            images = _image_detector.extract_from_node(node, base_url)
+
+            if not any([title, url, price is not None, images]):
+                continue
+
+            raw = {
+                "title": title,
+                "description": description,
+                "url": url,
+                "price": price,
+                "images": images,
+                "sku": _extract_sku(description),
+                "ean": _extract_ean(description),
+            }
+            normalized = _normalize_item(raw, source="css", base_url=base_url)
+            key = _identity_key(normalized)
+            if key in seen:
+                continue
+            seen.add(key)
+            products.append(normalized)
+        if products:
+            break
     return products
 
 
@@ -280,33 +741,49 @@ class UniversalParser:
     def parse(self, html: str, base_url: str = "") -> list[dict[str, Any]]:
         if not html:
             return []
-
-        # Prefer explicit application/json embeds (API data) when available
-        appjson_products = _extract_application_json_data(html)
-        if appjson_products:
-            return appjson_products
-
-        jsonld_products = _extract_jsonld_data(html)
-        if jsonld_products:
-            return jsonld_products
-
         soup = BeautifulSoup(html, "lxml")
-        schema_products = _extract_schema_microdata_products(soup, base_url)
-        if schema_products:
-            return schema_products
-        products = _extract_dom_products(soup, base_url)
-        if products:
-            return products
 
-        # Last-resort generic extraction for link-heavy catalogs.
-        products = _extract_link_based_products(soup, base_url)
-        return products
+        strategy_candidates: list[dict[str, Any]] = []
+
+        strategy_products = _extract_jsonld_data(html, base_url)
+        strategy_candidates.extend(strategy_products)
+
+        strategy_products = _extract_schema_microdata_products(soup, base_url)
+        strategy_candidates.extend(strategy_products)
+
+        strategy_products = _extract_opengraph_products(soup, base_url)
+        strategy_candidates.extend(strategy_products)
+
+        strategy_products = _extract_meta_products(soup, base_url)
+        strategy_candidates.extend(strategy_products)
+
+        for item in _extract_application_json_data(html):
+            strategy_candidates.append(_normalize_item(item, source="api", base_url=base_url))
+
+        for item in _extract_dom_products(soup, base_url):
+            strategy_candidates.append(_normalize_item(item, source="dom", base_url=base_url))
+
+        strategy_candidates.extend(_extract_css_products(soup, base_url))
+
+        if not strategy_candidates:
+            for item in _extract_link_based_products(soup, base_url):
+                strategy_candidates.append(_normalize_item(item, source="css", base_url=base_url))
+
+        scored: list[dict[str, Any]] = []
+        for item in strategy_candidates:
+            source = str(item.get("source") or "dom")
+            confidence, confidence_by_field = _score_item(item, source)
+            item["confidence"] = confidence
+            item["confidence_by_field"] = confidence_by_field
+            scored.append(item)
+
+        return _merge_items(scored)
 
     def parse_products(self, html: str, base_url: str = "") -> list[Product]:
         items = self.parse(html, base_url)
         products: list[Product] = []
         for item in items:
-            images = item.get("images") or []
+            images = item.get("gallery") or item.get("images") or []
             image = images[0] if images else ""
             products.append(
                 Product(
@@ -315,7 +792,7 @@ class UniversalParser:
                     price=item.get("price"),
                     compare_at_price=item.get("compare_at_price"),
                     sku=item.get("sku") or "",
-                    barcode=item.get("barcode") or "",
+                    barcode=item.get("barcode") or item.get("ean") or "",
                     brand=item.get("brand") or "",
                     category=item.get("category") or "",
                     image=image,
@@ -329,7 +806,7 @@ class UniversalParser:
         return products
 
     def parse_api_payloads(self, payloads: list[Any]) -> list[Product]:
-        products: list[Product] = []
+        normalized_items: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         for payload in payloads or []:
             for item in _iter_dict_nodes(payload):
@@ -345,21 +822,46 @@ class UniversalParser:
                     continue
                 seen.add(dedupe_key)
 
-                products.append(
-                    Product(
-                        title=title,
-                        description=_clean_text(item.get("description") or item.get("subtitle") or ""),
-                        price=_extract_price_from_item(item),
-                        compare_at_price=_parse_price(str(item.get("compare_at_price") or item.get("oldPrice") or "")),
-                        sku=sku,
-                        barcode=_clean_text(item.get("barcode") or ""),
-                        brand=_clean_text(item.get("brand") or item.get("manufacturer") or ""),
-                        category=_clean_text(item.get("category") or item.get("categoryName") or ""),
-                        image=images[0] if images else "",
-                        gallery=images,
-                        stock=item.get("stock") if isinstance(item.get("stock"), int) else None,
-                        tags=item.get("tags") if isinstance(item.get("tags"), list) else [],
-                        url=url,
-                    )
+                normalized = _normalize_item(
+                    {
+                        "title": title,
+                        "description": _clean_text(item.get("description") or item.get("subtitle") or ""),
+                        "price": _extract_price_from_item(item),
+                        "compare_at_price": _parse_price(str(item.get("compare_at_price") or item.get("oldPrice") or "")),
+                        "sku": sku,
+                        "ean": _clean_text(item.get("ean") or item.get("gtin") or item.get("barcode") or ""),
+                        "brand": _clean_text(item.get("brand") or item.get("manufacturer") or ""),
+                        "category": _clean_text(item.get("category") or item.get("categoryName") or ""),
+                        "images": images,
+                        "stock": item.get("stock") if isinstance(item.get("stock"), int) else item.get("availability"),
+                        "tags": item.get("tags") if isinstance(item.get("tags"), list) else item.get("keywords") or [],
+                        "url": url,
+                    },
+                    source="api",
                 )
+                confidence, confidence_by_field = _score_item(normalized, "api")
+                normalized["confidence"] = confidence
+                normalized["confidence_by_field"] = confidence_by_field
+                normalized_items.append(normalized)
+
+        products: list[Product] = []
+        for item in _merge_items(normalized_items):
+            images = item.get("gallery") or []
+            products.append(
+                Product(
+                    title=item.get("title") or "",
+                    description=item.get("description") or "",
+                    price=item.get("price"),
+                    compare_at_price=item.get("compare_at_price"),
+                    sku=item.get("sku") or "",
+                    barcode=item.get("barcode") or item.get("ean") or "",
+                    brand=item.get("brand") or "",
+                    category=item.get("category") or "",
+                    image=images[0] if images else "",
+                    gallery=images,
+                    stock=item.get("stock") if isinstance(item.get("stock"), int) else None,
+                    tags=item.get("tags") if isinstance(item.get("tags"), list) else [],
+                    url=item.get("url") or "",
+                )
+            )
         return products

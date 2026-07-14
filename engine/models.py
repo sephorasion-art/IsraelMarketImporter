@@ -57,6 +57,9 @@ class EnginePayload:
 	response_headers: dict[str, str] = field(default_factory=dict)
 	network_calls: list[str] = field(default_factory=list)
 	api_payloads: list[Any] = field(default_factory=list)
+	screenshots: list[str] = field(default_factory=list)
+	logs: list[str] = field(default_factory=list)
+	elapsed_ms: int = 0
 
 
 class ImportResult(BaseModel):
