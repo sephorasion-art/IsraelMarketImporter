@@ -55,12 +55,14 @@ class EnginePayload:
 	status_code: int | None = None
 	final_url: str | None = None
 	response_headers: dict[str, str] = field(default_factory=dict)
+	dom_product_elements: int = 0
 	network_calls: list[str] = field(default_factory=list)
 	api_urls: list[str] = field(default_factory=list)
 	api_payloads: list[Any] = field(default_factory=list)
 	discovered_products: list[Product] = field(default_factory=list)
 	screenshots: list[str] = field(default_factory=list)
 	logs: list[str] = field(default_factory=list)
+	errors: list[str] = field(default_factory=list)
 	elapsed_ms: int = 0
 
 

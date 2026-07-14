@@ -181,20 +181,46 @@ class PlaywrightEngine(BaseEngine):
         self,
         logs: list[str],
         url: str,
+        status_code: int | None,
+        page_title: str,
+        dom_elements: int,
         api_urls: list[str],
         json_count: int,
         products_count: int,
         elapsed_ms: int,
     ) -> None:
-        if not self.debug:
-            return
+        # Keep technical diagnostics even when debug is disabled.
         logs.append(f"debug.url={url}")
+        logs.append(f"debug.http_status={status_code if status_code is not None else 'unknown'}")
+        logs.append(f"debug.page_title={page_title}")
+        logs.append(f"debug.dom_elements={dom_elements}")
         logs.append(f"debug.apis_detected={len(api_urls)}")
         logs.append(f"debug.json_responses={json_count}")
         logs.append(f"debug.products_found={products_count}")
         logs.append(f"debug.analysis_ms={elapsed_ms}")
-        for api_url in api_urls[:50]:
-            logs.append(f"debug.api_url={api_url}")
+        if self.debug:
+            for api_url in api_urls[:50]:
+                logs.append(f"debug.api_url={api_url}")
+
+    async def _count_dom_product_elements(self, page) -> int:
+        selectors = [
+            ".product",
+            ".product-card",
+            ".product-item",
+            ".product-listing",
+            ".product-grid-item",
+            "[itemtype*='schema.org/Product']",
+            "article",
+            ".card",
+        ]
+        for selector in selectors:
+            try:
+                count = await page.locator(selector).count()
+                if count > 0:
+                    return int(count)
+            except Exception:
+                continue
+        return 0
 
     async def _scrape_async_payload(self, url: str, options: RuntimeOptions | None = None) -> EnginePayload:
         options = options or RuntimeOptions()
@@ -202,6 +228,7 @@ class PlaywrightEngine(BaseEngine):
 
         started_at = time.perf_counter()
         logs: list[str] = []
+        errors: list[str] = []
         network_calls: list[str] = []
         network_events: list[dict[str, str]] = []
         api_payloads: list[dict | list] = []
@@ -286,6 +313,7 @@ class PlaywrightEngine(BaseEngine):
                             api_payloads.append(data)
                             self._log(logs, f"json_response_captured={response_url}")
                 except Exception:
+                    errors.append("json_capture_failed")
                     return
 
             def on_request(request):
@@ -316,7 +344,13 @@ class PlaywrightEngine(BaseEngine):
             page.on("response", on_response)
 
             self._log(logs, f"goto={url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            goto_response = await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            status_code = None
+            if goto_response:
+                try:
+                    status_code = int(goto_response.status)
+                except Exception:
+                    status_code = None
             await self._wait_for_network_idle(page, logs, timeout_ms=15000)
 
             shot = os.path.join(screenshots_dir, "stage_01_loaded.png")
@@ -354,11 +388,13 @@ class PlaywrightEngine(BaseEngine):
                             json_urls_seen.add(req_url)
                             self._log(logs, f"json_replayed_from_request={req_url}")
                 except Exception:
+                    errors.append("json_replay_failed")
                     continue
 
             title = await page.title()
             html = await page.content()
             final_url = page.url
+            dom_product_elements = await self._count_dom_product_elements(page)
             api_urls = self.discovery.discover_api_urls(network_events)
             discovered_products = self.discovery.discover_products(api_payloads)
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
@@ -366,6 +402,9 @@ class PlaywrightEngine(BaseEngine):
             self._debug_summary(
                 logs,
                 url=final_url or url,
+                status_code=status_code,
+                page_title=title or "",
+                dom_elements=dom_product_elements,
                 api_urls=api_urls,
                 json_count=len(api_payloads),
                 products_count=len(discovered_products),
@@ -377,15 +416,17 @@ class PlaywrightEngine(BaseEngine):
             return EnginePayload(
                 html=html,
                 title=title or "",
-                status_code=200,
+                status_code=status_code,
                 final_url=final_url,
                 response_headers={},
+                dom_product_elements=dom_product_elements,
                 network_calls=network_calls,
                 api_urls=api_urls,
                 api_payloads=api_payloads,
                 discovered_products=discovered_products,
                 screenshots=screenshots,
                 logs=logs,
+                errors=errors,
                 elapsed_ms=elapsed_ms,
             )
 
@@ -418,8 +459,10 @@ class PlaywrightEngine(BaseEngine):
         payload = self.scrape_payload(url, options)
         return {
             "title": payload.title,
+            "status_code": payload.status_code,
             "html": payload.html,
             "json": payload.api_payloads,
+            "dom_product_elements": payload.dom_product_elements,
             "network_calls": payload.network_calls,
             "api_urls": payload.api_urls,
             "api_payloads": payload.api_payloads,
@@ -427,6 +470,7 @@ class PlaywrightEngine(BaseEngine):
             "final_url": payload.final_url,
             "screenshots": payload.screenshots,
             "logs": payload.logs,
+            "errors": payload.errors,
             "elapsed_ms": payload.elapsed_ms,
         }
 
