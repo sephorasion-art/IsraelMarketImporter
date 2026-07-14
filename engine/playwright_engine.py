@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 import threading
@@ -10,6 +11,16 @@ from engine.models import EnginePayload, RuntimeOptions
 
 
 class PlaywrightEngine(BaseEngine):
+
+    _TELEMETRY_HOST_HINTS = (
+        "mc.yango.com",
+        "google-analytics",
+        "doubleclick",
+        "facebook.com/tr",
+        "stats.g",
+        "analytics",
+        "sentry",
+    )
 
     def __init__(self, headless: bool = True, debug: bool = False) -> None:
         self.headless = headless
@@ -222,6 +233,10 @@ class PlaywrightEngine(BaseEngine):
                 continue
         return 0
 
+    def _is_telemetry_url(self, url: str) -> bool:
+        lower = (url or "").lower()
+        return any(hint in lower for hint in self._TELEMETRY_HOST_HINTS)
+
     async def _scrape_async_payload(self, url: str, options: RuntimeOptions | None = None) -> EnginePayload:
         options = options or RuntimeOptions()
         from playwright.async_api import async_playwright
@@ -291,7 +306,7 @@ class PlaywrightEngine(BaseEngine):
 
             async def capture_json_response(response) -> None:
                 try:
-                    if len(api_payloads) >= 30:
+                    if len(api_payloads) >= 120:
                         return
                     response_url = response.url or ""
                     resource_type = ""
@@ -304,16 +319,26 @@ class PlaywrightEngine(BaseEngine):
                     ctype = (response.headers.get("content-type") or "").lower()
                     looks_json = "json" in ctype or "graphql" in labels or "json" in labels or "api" in labels
 
+                    if self._is_telemetry_url(response_url):
+                        return
+
                     if looks_json:
                         if response_url in json_urls_seen:
                             return
                         json_urls_seen.add(response_url)
-                        data = await response.json()
+                        data = None
+                        try:
+                            data = await response.json()
+                        except Exception:
+                            text = await response.text()
+                            if text:
+                                data = json.loads(text)
                         if isinstance(data, (dict, list)):
                             api_payloads.append(data)
                             self._log(logs, f"json_response_captured={response_url}")
                 except Exception:
-                    errors.append("json_capture_failed")
+                    if hasattr(response, "headers") and "json" in (response.headers.get("content-type") or "").lower():
+                        errors.append(f"json_capture_failed:{response.url if hasattr(response, 'url') else 'unknown'}")
                     return
 
             def on_request(request):
@@ -376,19 +401,29 @@ class PlaywrightEngine(BaseEngine):
 
             # Pull a limited set of JSON responses to feed parser fallbacks.
             for req_url in network_calls:
-                if len(api_payloads) >= 10:
+                if len(api_payloads) >= 30:
                     break
                 try:
                     labels = self.discovery.classify_url(req_url, "")
+                    if self._is_telemetry_url(req_url):
+                        continue
                     if labels and req_url not in json_urls_seen:
                         resp = await page.request.get(req_url, timeout=5000)
                         ctype = (resp.headers.get("content-type") or "").lower()
                         if "json" in ctype:
-                            api_payloads.append(await resp.json())
+                            data = None
+                            try:
+                                data = await resp.json()
+                            except Exception:
+                                text = await resp.text()
+                                if text:
+                                    data = json.loads(text)
+                            if isinstance(data, (dict, list)):
+                                api_payloads.append(data)
                             json_urls_seen.add(req_url)
                             self._log(logs, f"json_replayed_from_request={req_url}")
                 except Exception:
-                    errors.append("json_replay_failed")
+                    errors.append(f"json_replay_failed:{req_url}")
                     continue
 
             title = await page.title()

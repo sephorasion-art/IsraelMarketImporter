@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from engine.models import Product
 
@@ -13,17 +14,18 @@ class ApiDiscoveryEngine:
     def classify_url(self, url: str, resource_type: str = "") -> list[str]:
         labels: list[str] = []
         lower_url = (url or "").lower()
+        parsed_path = urlparse(lower_url).path if lower_url else ""
         rt = (resource_type or "").lower()
 
         if rt == "fetch":
             labels.append("fetch")
         if rt == "xhr":
             labels.append("xhr")
-        if "graphql" in lower_url:
+        if "graphql" in parsed_path:
             labels.append("graphql")
-        if ".json" in lower_url or "format=json" in lower_url:
+        if ".json" in parsed_path or "format=json" in lower_url:
             labels.append("json")
-        if any(token in lower_url for token in self.URL_TOKENS):
+        if any(token in parsed_path for token in self.URL_TOKENS):
             labels.append("api")
 
         dedup: list[str] = []
@@ -79,9 +81,10 @@ class ApiDiscoveryEngine:
         has_image = "image" in keys or "images" in keys or "thumbnail" in keys
         has_id = "sku" in keys or "id" in keys or "productid" in keys
         has_category = "category" in keys or "categoryname" in keys
+        has_url = "url" in keys or "producturl" in keys or "slug" in keys
 
-        score = sum([has_name, has_price, has_image, has_id, has_category])
-        return bool(has_name and score >= 3)
+        score = sum([has_name, has_price, has_image, has_id, has_category, has_url])
+        return bool((has_name and score >= 2) or (has_name and has_price) or (has_name and has_image))
 
     @staticmethod
     def _to_list_images(value: Any) -> list[str]:
@@ -117,10 +120,25 @@ class ApiDiscoveryEngine:
                 return None
         return None
 
+    @staticmethod
+    def _extract_price(node: dict[str, Any]) -> float | None:
+        for key in ("price", "currentPrice", "salePrice", "amount", "value", "final_price"):
+            parsed = ApiDiscoveryEngine._to_float(node.get(key))
+            if parsed is not None:
+                return parsed
+        for key in ("offers", "pricing", "priceInfo", "price_data"):
+            nested = node.get(key)
+            if isinstance(nested, dict):
+                for nested_key in ("price", "current", "amount", "value", "salePrice"):
+                    parsed = ApiDiscoveryEngine._to_float(nested.get(nested_key))
+                    if parsed is not None:
+                        return parsed
+        return None
+
     def _to_product(self, node: dict[str, Any]) -> Product:
         title = str(node.get("title") or node.get("name") or node.get("displayName") or "").strip()
         description = str(node.get("description") or node.get("subtitle") or "").strip()
-        price = self._to_float(node.get("price") or node.get("currentPrice") or node.get("salePrice"))
+        price = self._extract_price(node)
         compare_at_price = self._to_float(node.get("oldPrice") or node.get("compare_at_price") or node.get("listPrice"))
         sku = str(node.get("sku") or node.get("productId") or node.get("id") or "").strip()
         barcode = str(node.get("ean") or node.get("gtin") or node.get("barcode") or "").strip()
