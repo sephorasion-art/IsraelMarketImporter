@@ -20,6 +20,60 @@ _translation_cache = {}
 pipeline = ImportPipeline()
 
 
+def _extract_debug_metric(logs: list[str], prefix: str, default: int = 0) -> int:
+    for line in logs:
+        if line.startswith(prefix):
+            match = re.search(r"(\d+)", line)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    return default
+    return default
+
+
+def _site_label_from_url(url: str) -> str:
+    host = (urlparse(url).netloc or "").lower().replace("www.", "")
+    if not host:
+        return "Inconnu"
+    return host.split(".")[0].capitalize()
+
+
+def _build_analysis_context(url: str, result, produits: list[dict]) -> dict:
+    execution_logs = [f"[{entry.level}] {entry.message}" for entry in result.logs]
+
+    js_enabled = bool(
+        result.detection.is_react
+        or result.detection.is_nextjs
+        or any(
+            tech.lower() in {"react", "nextjs", "vue", "angular", "nuxt", "astro", "alpine"}
+            for tech in result.detection.technologies
+        )
+    )
+    api_count = _extract_debug_metric(execution_logs, "[info] Debug API détectées:")
+    json_count = _extract_debug_metric(execution_logs, "[info] Debug réponses JSON:")
+
+    has_images = any(bool((p.get("image") or "").strip() or p.get("gallery") or p.get("images")) for p in produits)
+    has_prices = any(p.get("price") is not None for p in produits)
+
+    return {
+        "analysis_ready": True,
+        "detected_site": _site_label_from_url(url),
+        "detected_domain": result.detection.domain,
+        "detected_tech": ", ".join(result.detection.technologies),
+        "detected_cms": result.detection.cms,
+        "javascript_enabled": "Oui" if js_enabled else "Non",
+        "detected_api_count": api_count,
+        "detected_json_count": json_count,
+        "products_found": len(produits),
+        "has_images": "Oui" if has_images else "Non",
+        "has_prices": "Oui" if has_prices else "Non",
+        "engine_used": result.engine_used,
+        "analysis_time": result.elapsed_ms,
+        "execution_logs": execution_logs,
+    }
+
+
 def _clean_text(text: str) -> str:
     if not text:
         return ""
@@ -103,6 +157,52 @@ async def home(request: Request):
     )
 
 
+@app.post("/analyser", response_class=HTMLResponse)
+async def analyser_page(
+    request: Request,
+    url: str = Form(...),
+    proxy_url: str = Form(""),
+    cookie_header: str = Form(""),
+    user_agent: str = Form(""),
+):
+
+    try:
+        options = RuntimeOptions(
+            proxy_url=proxy_url.strip() or None,
+            cookie_header=cookie_header.strip() or None,
+            user_agent=user_agent.strip() or None,
+            debug=True,
+        )
+        result = pipeline.run(url, options=options)
+        produits = [p.model_dump() for p in result.products]
+        context = _build_analysis_context(url, result, produits)
+
+        return templates.TemplateResponse(
+            request=request,
+            name="index.html",
+            context={
+                "url": url,
+                "message": "Analyse terminée",
+                "proxy_url": proxy_url,
+                "cookie_header": cookie_header,
+                "user_agent": user_agent,
+                **context,
+            },
+        )
+    except Exception as e:
+        return templates.TemplateResponse(
+            request=request,
+            name="index.html",
+            context={
+                "url": url,
+                "message": f"❌ Erreur : {str(e)}",
+                "proxy_url": proxy_url,
+                "cookie_header": cookie_header,
+                "user_agent": user_agent,
+            },
+        )
+
+
 @app.post("/importer", response_class=HTMLResponse)
 async def importer_page(
     request: Request,
@@ -117,6 +217,7 @@ async def importer_page(
             proxy_url=proxy_url.strip() or None,
             cookie_header=cookie_header.strip() or None,
             user_agent=user_agent.strip() or None,
+            debug=True,
         )
         result = pipeline.run(url, options=options)
         produits = [p.model_dump() for p in result.products]
@@ -137,6 +238,8 @@ async def importer_page(
         except Exception:
             pass
 
+        analysis_context = _build_analysis_context(url, result, produits)
+
         return templates.TemplateResponse(
             request=request,
             name="index.html",
@@ -144,15 +247,10 @@ async def importer_page(
                 "url": url,
                 "produits": produits,
                 "message": f"✅ {len(produits)} produits trouvés",
-                "detected_site": result.detection.domain,
-                "detected_tech": ", ".join(result.detection.technologies),
-                "detected_cms": result.detection.cms,
-                "engine_used": result.engine_used,
-                "analysis_time": result.elapsed_ms,
-                "execution_logs": [f"[{entry.level}] {entry.message}" for entry in result.logs],
                 "proxy_url": proxy_url,
                 "cookie_header": cookie_header,
                 "user_agent": user_agent,
+                **analysis_context,
             }
         )
 

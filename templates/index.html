@@ -20,6 +20,14 @@
 
             <p>Moteur universel d'import e-commerce depuis une seule URL</p>
 
+            <div class="border rounded p-3 mb-3 bg-white">
+                <div class="fw-semibold">URL</div>
+                <div class="text-muted">↓</div>
+                <div class="fw-semibold">ANALYSER</div>
+                <div class="text-muted">↓</div>
+                <div class="fw-semibold">IMPORTER</div>
+            </div>
+
             <form action="/importer" method="post">
 
                 <div class="mb-3">
@@ -72,7 +80,11 @@
                     </div>
                 </details>
 
-                <button type="submit" class="btn btn-primary" id="import-btn">
+                <button type="submit" formaction="/analyser" class="btn btn-outline-primary" id="analyze-btn">
+                    ANALYSER
+                </button>
+
+                <button type="submit" formaction="/importer" class="btn btn-primary" id="import-btn">
                     IMPORTER
                 </button>
 
@@ -84,15 +96,40 @@
                 {{ message }}
             </div>
 
+            {% endif %}
+
+            {% if analysis_ready %}
+
             <div class="row g-3 mb-3">
                 <div class="col-md-6">
                     <div class="border rounded p-2 bg-white small"><strong>Site détecté:</strong> {{ detected_site if detected_site else '-' }}</div>
                 </div>
                 <div class="col-md-6">
+                    <div class="border rounded p-2 bg-white small"><strong>Domaine détecté:</strong> {{ detected_domain if detected_domain else '-' }}</div>
+                </div>
+                <div class="col-md-6">
                     <div class="border rounded p-2 bg-white small"><strong>CMS détecté:</strong> {{ detected_cms if detected_cms else '-' }}</div>
                 </div>
                 <div class="col-md-6">
+                    <div class="border rounded p-2 bg-white small"><strong>JavaScript:</strong> {{ javascript_enabled if javascript_enabled else '-' }}</div>
+                </div>
+                <div class="col-md-6">
                     <div class="border rounded p-2 bg-white small"><strong>Technologies détectées:</strong> {{ detected_tech if detected_tech else '-' }}</div>
+                </div>
+                <div class="col-md-3">
+                    <div class="border rounded p-2 bg-white small"><strong>API détectées:</strong> {{ detected_api_count if detected_api_count is not none else '-' }}</div>
+                </div>
+                <div class="col-md-3">
+                    <div class="border rounded p-2 bg-white small"><strong>Réponses JSON:</strong> {{ detected_json_count if detected_json_count is not none else '-' }}</div>
+                </div>
+                <div class="col-md-3">
+                    <div class="border rounded p-2 bg-white small"><strong>Produits trouvés:</strong> {{ products_found if products_found is not none else '-' }}</div>
+                </div>
+                <div class="col-md-3">
+                    <div class="border rounded p-2 bg-white small"><strong>Images:</strong> {{ has_images if has_images else '-' }}</div>
+                </div>
+                <div class="col-md-3">
+                    <div class="border rounded p-2 bg-white small"><strong>Prix:</strong> {{ has_prices if has_prices else '-' }}</div>
                 </div>
                 <div class="col-md-3">
                     <div class="border rounded p-2 bg-white small"><strong>Moteur utilisé:</strong> {{ engine_used if engine_used else '-' }}</div>
@@ -111,8 +148,6 @@
                     {% endfor %}
                 </div>
             </div>
-            {% endif %}
-
             {% endif %}
 
             {% if produits %}
@@ -155,6 +190,7 @@
                 </div>
             </form>
             {% endif %}
+            {% endif %}
         </div>
 
     </div>
@@ -165,12 +201,20 @@
 <script>
 document.addEventListener('DOMContentLoaded', function () {
     const form = document.querySelector('form[action="/importer"]');
-    const btn = document.getElementById('import-btn');
-    if (!form || !btn) return;
+    const importBtn = document.getElementById('import-btn');
+    const analyzeBtn = document.getElementById('analyze-btn');
+    if (!form) return;
     form.addEventListener('submit', function (e) {
         try {
-            btn.disabled = true;
-            btn.textContent = '⏳ Import en cours...';
+            const submitter = e.submitter;
+            if (submitter && submitter.id === 'analyze-btn' && analyzeBtn) {
+                analyzeBtn.disabled = true;
+                analyzeBtn.textContent = '⏳ Analyse en cours...';
+            }
+            if (submitter && submitter.id === 'import-btn' && importBtn) {
+                importBtn.disabled = true;
+                importBtn.textContent = '⏳ Import en cours...';
+            }
         } catch (err) {
             // ignore
         }
