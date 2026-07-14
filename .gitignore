@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated exporter outputs
+downloads/images/
+downloads/*.csv
+downloads/*.json
+downloads/*.html
+downloads/*.zip

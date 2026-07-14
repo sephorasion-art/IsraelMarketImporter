@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Israel Market Importer</title>
+    <title>Israel Market Importer PRO</title>
 
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
@@ -16,9 +16,9 @@
 
         <div class="card-body">
 
-            <h1>🇮🇱 Israel Market Importer</h1>
+            <h1>Israel Market Importer PRO</h1>
 
-            <p>Importer automatiquement des produits vers Shopify</p>
+            <p>Moteur universel d'import e-commerce depuis une seule URL</p>
 
             <form action="/importer" method="post">
 
@@ -39,8 +39,41 @@
 
                 </div>
 
-                <button class="btn btn-primary">
-                    🚀 Importer
+                <details class="mb-3">
+                    <summary class="small text-muted">Session autorisée (optionnel): proxy / cookies / user-agent</summary>
+                    <div class="mt-2">
+                        <label class="form-label">Proxy URL (résidentiel légal, ex: http://user:pass@host:port)</label>
+                        <input
+                            type="text"
+                            name="proxy_url"
+                            class="form-control"
+                            placeholder="http://user:pass@host:port"
+                            value="{{ proxy_url if proxy_url else '' }}"
+                        >
+                    </div>
+                    <div class="mt-2">
+                        <label class="form-label">Cookie header</label>
+                        <textarea
+                            name="cookie_header"
+                            class="form-control"
+                            rows="3"
+                            placeholder="key1=value1; key2=value2"
+                        >{{ cookie_header if cookie_header else '' }}</textarea>
+                    </div>
+                    <div class="mt-2">
+                        <label class="form-label">User-Agent personnalisé</label>
+                        <input
+                            type="text"
+                            name="user_agent"
+                            class="form-control"
+                            placeholder="Mozilla/5.0 ..."
+                            value="{{ user_agent if user_agent else '' }}"
+                        >
+                    </div>
+                </details>
+
+                <button type="submit" class="btn btn-primary" id="import-btn">
+                    IMPORTER
                 </button>
 
             </form>
@@ -51,8 +84,77 @@
                 {{ message }}
             </div>
 
+            <div class="row g-3 mb-3">
+                <div class="col-md-6">
+                    <div class="border rounded p-2 bg-white small"><strong>Site détecté:</strong> {{ detected_site if detected_site else '-' }}</div>
+                </div>
+                <div class="col-md-6">
+                    <div class="border rounded p-2 bg-white small"><strong>CMS détecté:</strong> {{ detected_cms if detected_cms else '-' }}</div>
+                </div>
+                <div class="col-md-6">
+                    <div class="border rounded p-2 bg-white small"><strong>Technologies détectées:</strong> {{ detected_tech if detected_tech else '-' }}</div>
+                </div>
+                <div class="col-md-3">
+                    <div class="border rounded p-2 bg-white small"><strong>Moteur utilisé:</strong> {{ engine_used if engine_used else '-' }}</div>
+                </div>
+                <div class="col-md-3">
+                    <div class="border rounded p-2 bg-white small"><strong>Temps d'analyse:</strong> {{ analysis_time if analysis_time else '-' }} ms</div>
+                </div>
+            </div>
+
+            {% if execution_logs %}
+            <div class="mb-3">
+                <h5>Journal d'exécution</h5>
+                <div class="border rounded bg-white p-2" style="max-height: 200px; overflow: auto;">
+                    {% for log in execution_logs %}
+                        <div class="small text-muted">{{ log }}</div>
+                    {% endfor %}
+                </div>
+            </div>
             {% endif %}
 
+            {% endif %}
+
+            {% if produits %}
+            <hr/>
+            <h3 class="mt-3">Produits trouvés — sélectionnez ceux à exporter</h3>
+            <form id="export-form" action="/export" method="post">
+                <input type="hidden" name="products_json" id="products_json" value='{{ produits|tojson|safe }}'>
+                <div class="mb-3">
+                    <button type="button" id="select-all" class="btn btn-sm btn-outline-secondary">Tout sélectionner</button>
+                    <button type="button" id="deselect-all" class="btn btn-sm btn-outline-secondary">Tout désélectionner</button>
+                    <button type="submit" class="btn btn-success btn-sm ms-2">📥 Générer CSV Shopify</button>
+                    <button type="submit" formaction="/export_zip" class="btn btn-primary btn-sm ms-2">🗜️ Télécharger ZIP (CSV + images)</button>
+                </div>
+
+                <div class="list-group">
+                {% for p in produits %}
+                    <label class="list-group-item d-flex flex-column">
+                        <div class="d-flex align-items-start w-100">
+                            <input type="checkbox" name="selected" value="{{ loop.index0 }}" class="form-check-input me-2"> 
+                            <div>
+                                <strong>{{ p.nom if p.nom else (p.title if p.title else '') }}</strong>
+                                {% if p.price %}&nbsp;—&nbsp;<span>{{ p.price }} €{% endif %}</span>
+                                <div class="small text-muted">{{ (p.description[:180] + '...') if p.description }} </div>
+                            </div>
+                        </div>
+                        <div class="mt-2">
+                            <label class="form-label small">Image à utiliser pour l'export :</label>
+                            <select name="image_{{ loop.index0 }}" class="form-select form-select-sm">
+                                <option value="">(choisir par défaut)</option>
+                                {% for img in (p.images or []) %}
+                                    <option value="{{ img }}">{{ img }}</option>
+                                {% endfor %}
+                                {% for img in (p._downloaded_images or []) %}
+                                    <option value="{{ img }}">{{ img }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </label>
+                {% endfor %}
+                </div>
+            </form>
+            {% endif %}
         </div>
 
     </div>
@@ -60,4 +162,31 @@
 </div>
 
 </body>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    const form = document.querySelector('form[action="/importer"]');
+    const btn = document.getElementById('import-btn');
+    if (!form || !btn) return;
+    form.addEventListener('submit', function (e) {
+        try {
+            btn.disabled = true;
+            btn.textContent = '⏳ Import en cours...';
+        } catch (err) {
+            // ignore
+        }
+    });
+});
+</script>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    const selectAll = document.getElementById('select-all');
+    const deselectAll = document.getElementById('deselect-all');
+    if (selectAll) selectAll.addEventListener('click', function(){
+        document.querySelectorAll('input[type="checkbox"][name="selected"]').forEach(cb=>cb.checked=true);
+    });
+    if (deselectAll) deselectAll.addEventListener('click', function(){
+        document.querySelectorAll('input[type="checkbox"][name="selected"]').forEach(cb=>cb.checked=false);
+    });
+});
+</script>
 </html>

@@ -1,21 +1,19 @@
-from engine.playwright_engine import PlaywrightEngine
-from engine.parser import UniversalParser
+import pytest
 
-url = "https://deli.yango.com/en-il/catalog/grocery/category/snacks"
 
-engine = PlaywrightEngine()
+def test_parser_playwright_smoke():
+    pytest.importorskip("playwright")
+    from engine.playwright_engine import PlaywrightEngine
+    from engine.parser import UniversalParser
 
-html = engine.get_html(url)
+    url = "https://deli.yango.com/en-il/catalog/grocery/category/snacks"
+    engine = PlaywrightEngine()
 
-parser = UniversalParser()
+    try:
+        html = engine.get_html(url)
+    except Exception as exc:
+        pytest.skip(f"Playwright/network unavailable in this environment: {exc}")
 
-products = parser.parse(html)
-
-print(f"Produits trouvés : {len(products)}")
-
-for p in products[:10]:
-    print("--------------------------------")
-    print(p.title)
-    print(p.price)
-    print(p.image)
-    print(p.url)
+    parser = UniversalParser()
+    products = parser.parse(html)
+    assert isinstance(products, list)
