@@ -56,6 +56,12 @@ class ImportPipeline:
             if products:
                 logger.info(f"Produits extraits via parse_api_payloads: {len(products)}")
 
+        if not products:
+            logger.info("Aucun produit via réseau, tentative JSON embarqué dans la page")
+            products = self.parser.parse_embedded_payloads(payload.html)
+            if products:
+                logger.info(f"Produits extraits via JSON embarqué: {len(products)}")
+
         # 4) Fallback API engine.
         if not products:
             logger.info("Toujours 0 produit, fallback ApiEngine")

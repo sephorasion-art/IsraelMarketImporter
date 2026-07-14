@@ -461,6 +461,41 @@ def _extract_application_json_data(html: str) -> list[dict[str, Any]]:
     return products
 
 
+def _extract_embedded_json_payloads(html: str) -> list[Any]:
+    soup = BeautifulSoup(html or "", "lxml")
+    payloads: list[Any] = []
+
+    for script in soup.find_all("script"):
+        script_type = (script.get("type") or "").lower()
+        script_id = (script.get("id") or "").lower()
+        raw = script.string or script.get_text() or ""
+        text = raw.strip()
+        if not text:
+            continue
+
+        likely_json = (
+            "json" in script_type
+            or script_id in {"__next_data__", "__nuxt", "__initial_state__"}
+            or text.startswith("{")
+            or text.startswith("[")
+        )
+        if not likely_json:
+            continue
+
+        if len(text) > 4_000_000:
+            continue
+
+        try:
+            payload = json.loads(text)
+        except Exception:
+            continue
+
+        if isinstance(payload, (dict, list)):
+            payloads.append(payload)
+
+    return payloads
+
+
 def _extract_dom_products(soup: BeautifulSoup, base_url: str = "") -> list[dict[str, Any]]:
     return _product_detector.detect_from_dom(str(soup), base_url)
 
@@ -729,8 +764,20 @@ def _extract_price_from_item(item: dict[str, Any]) -> float | None:
 
 
 def _is_product_like(item: dict[str, Any]) -> bool:
-    title = _clean_text(item.get("name") or item.get("title") or item.get("displayName") or "")
-    sku_like = _clean_text(item.get("sku") or item.get("id") or item.get("productId") or "")
+    title = _clean_text(
+        item.get("name")
+        or item.get("title")
+        or item.get("displayName")
+        or item.get("display_name")
+        or ""
+    )
+    sku_like = _clean_text(
+        item.get("sku")
+        or item.get("id")
+        or item.get("productId")
+        or item.get("product_id")
+        or ""
+    )
     has_price = _extract_price_from_item(item) is not None
     has_image = bool(_extract_images_from_item(item))
     return bool(title and (has_price or has_image or sku_like))
@@ -812,10 +859,16 @@ class UniversalParser:
             for item in _iter_dict_nodes(payload):
                 if not _is_product_like(item):
                     continue
-                title = _clean_text(item.get("name") or item.get("title") or item.get("displayName") or "")
+                title = _clean_text(
+                    item.get("name")
+                    or item.get("title")
+                    or item.get("displayName")
+                    or item.get("display_name")
+                    or ""
+                )
                 images = _extract_images_from_item(item)
-                url = item.get("url") or item.get("productUrl") or ""
-                sku = _clean_text(item.get("sku") or item.get("productId") or item.get("id") or "")
+                url = item.get("url") or item.get("productUrl") or item.get("product_url") or ""
+                sku = _clean_text(item.get("sku") or item.get("productId") or item.get("product_id") or item.get("id") or "")
 
                 dedupe_key = (title.lower(), sku or url)
                 if dedupe_key in seen:
@@ -865,3 +918,9 @@ class UniversalParser:
                 )
             )
         return products
+
+    def parse_embedded_payloads(self, html: str) -> list[Product]:
+        payloads = _extract_embedded_json_payloads(html)
+        if not payloads:
+            return []
+        return self.parse_api_payloads(payloads)

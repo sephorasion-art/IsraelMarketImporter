@@ -139,3 +139,37 @@ def test_universal_parser_fallback_merges_strategies_with_confidence():
     assert p["confidence"] > 0
     assert isinstance(p["confidence_by_field"], dict)
     assert "price" in p["confidence_by_field"]
+
+
+def test_universal_parser_extracts_products_from_embedded_json_payloads():
+    html = '''
+    <html><head>
+      <script id="__NEXT_DATA__" type="application/json">
+      {
+        "props": {
+          "pageProps": {
+            "data": {
+              "items": [
+                {
+                  "id": "prod-1",
+                  "display_name": "Embedded Chips",
+                  "pricing": {"amount": "13.90"},
+                  "image": "https://example.com/chips.jpg",
+                  "categoryName": "Snacks"
+                }
+              ]
+            }
+          }
+        }
+      }
+      </script>
+    </head><body></body></html>
+    '''
+
+    parser = UniversalParser()
+    products = parser.parse_embedded_payloads(html)
+
+    assert len(products) == 1
+    assert products[0].title == "Embedded Chips"
+    assert products[0].price == 13.9
+    assert products[0].category == "Snacks"
