@@ -30,7 +30,9 @@ def test_playwright_engine_returns_extended_payload_fields(monkeypatch):
             title="Demo",
             final_url=url,
             network_calls=["https://example.com/api/products"],
+            api_urls=["https://example.com/api/products"],
             api_payloads=[{"products": [{"name": "Demo"}]}],
+            discovered_products=[],
             screenshots=["/tmp/shot1.png", "/tmp/shot2.png"],
             logs=["goto=https://example.com", "analysis_ms=123"],
             elapsed_ms=123,
@@ -42,6 +44,8 @@ def test_playwright_engine_returns_extended_payload_fields(monkeypatch):
 
     assert result["html"].startswith("<html>")
     assert isinstance(result["json"], list)
+    assert isinstance(result["api_urls"], list)
+    assert isinstance(result["products"], list)
     assert isinstance(result["screenshots"], list)
     assert isinstance(result["logs"], list)
     assert isinstance(result["elapsed_ms"], int)

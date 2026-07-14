@@ -3,7 +3,6 @@ from __future__ import annotations
 import time
 
 from engine.detector import Detector
-from engine.html_engine import HtmlEngine
 from engine.logger import ImportLogger
 from engine.models import ImportResult, RuntimeOptions
 from engine.playwright_engine import PlaywrightEngine
@@ -25,20 +24,21 @@ class ImportPipeline:
 
         logger.info(f"URL reçue: {url}")
 
-        # quick probe with HTML engine to bootstrap detection
-        probe = HtmlEngine().scrape(url, options)
-        report = self.detector.analyze(url, probe.html, probe.response_headers)
+        # API-first strategy for modern sites: Playwright interception before HTML parsing.
+        engine = PlaywrightEngine(debug=options.debug)
+        logger.info(f"Moteur choisi: {engine.__class__.__name__}")
+        payload = engine.scrape_payload(url, options)
+
+        report = self.detector.analyze(url, payload.html, payload.response_headers)
         logger.info(f"CMS détecté: {report.cms}")
         logger.info(f"Technologies: {', '.join(report.technologies)}")
 
-        engine = self.detector.resolve_engine(url, probe.html)
-        logger.info(f"Moteur choisi: {engine.__class__.__name__}")
-
-        if hasattr(engine, "scrape_payload"):
-            payload = engine.scrape_payload(url, options)
-        else:
-            payload = engine.scrape(url, options)
-        products = self.parser.parse_products(payload.html, base_url=payload.final_url or url)
+        products = list(payload.discovered_products or [])
+        if products:
+            logger.info(f"Produits détectés depuis réseau/API: {len(products)}")
+        elif payload.api_payloads:
+            logger.info("Aucun produit direct dans les réponses JSON, tentative parse_api_payloads")
+            products = self.parser.parse_api_payloads(payload.api_payloads)
 
         lower_html = (payload.html or "").lower()
         blocked = any(token in lower_html for token in ["<title>403", "captcha", "access denied", "forbidden"])
@@ -48,42 +48,22 @@ class ImportPipeline:
                 "Extraction limitée dans cet environnement."
             )
 
-        # fallback from intercepted API payloads when DOM extraction is weak
-        if not products and payload.api_payloads:
-            logger.info("Aucun produit DOM, tentative via payloads API")
-            products = self.parser.parse_api_payloads(payload.api_payloads)
-
-        # If API extraction returns too few items, try Playwright and keep best.
-        if isinstance(engine, ApiEngine) and len(products) <= 1:
-            logger.info("Extraction API faible (<=1), tentative Playwright pour enrichir")
-            try:
-                pw_payload = PlaywrightEngine().scrape_payload(url, options)
-                pw_products = self.parser.parse_products(pw_payload.html, base_url=pw_payload.final_url or url)
-                if not pw_products and pw_payload.api_payloads:
-                    pw_products = self.parser.parse_api_payloads(pw_payload.api_payloads)
-                if len(pw_products) > len(products):
-                    products = pw_products
-            except Exception as exc:
-                logger.warning(f"Fallback Playwright ignoré: {exc}")
-
-        # Robust fallback chain for dynamic stores: try Playwright, then API.
-        if not products and not isinstance(engine, PlaywrightEngine):
-            logger.info("Aucun produit trouvé, fallback Playwright")
-            pw_engine = PlaywrightEngine()
-            pw_payload = pw_engine.scrape_payload(url, options)
-            lower_pw = (pw_payload.html or "").lower()
-            if any(token in lower_pw for token in ["<title>403", "captcha", "access denied", "forbidden"]):
-                logger.warning("Fallback Playwright bloqué par protection anti-bot (403/captcha)")
-            products = self.parser.parse_products(pw_payload.html, base_url=pw_payload.final_url or url)
-            if not products and pw_payload.api_payloads:
-                logger.info("Fallback Playwright sans DOM produit, tentative payloads API")
-                products = self.parser.parse_api_payloads(pw_payload.api_payloads)
-
-        if not products and not isinstance(engine, ApiEngine):
+        if not products:
             logger.info("Toujours 0 produit, fallback ApiEngine")
             api_payload = ApiEngine().scrape(url, options)
             if api_payload.api_payloads:
                 products = self.parser.parse_api_payloads(api_payload.api_payloads)
+
+        if not products:
+            logger.info("Fallback final: parsing HTML (dernier recours)")
+            products = self.parser.parse_products(payload.html, base_url=payload.final_url or url)
+
+        if options.debug:
+            logger.info(f"Debug URL appelée: {payload.final_url or url}")
+            logger.info(f"Debug API détectées: {len(payload.api_urls)}")
+            logger.info(f"Debug réponses JSON: {len(payload.api_payloads)}")
+            logger.info(f"Debug produits trouvés: {len(products)}")
+            logger.info(f"Debug temps moteur: {payload.elapsed_ms} ms")
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         logger.info(f"Import terminé en {elapsed_ms} ms, {len(products)} produit(s)")

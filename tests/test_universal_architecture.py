@@ -1,5 +1,5 @@
 from engine.detector import Detector
-from engine.html_engine import HtmlEngine
+from engine.api_engine import ApiEngine
 from engine.models import EnginePayload
 from engine.parser import ImportPipeline
 from engine.playwright_engine import PlaywrightEngine
@@ -47,35 +47,39 @@ def test_universal_parser_schema_microdata_extraction():
 
 
 def test_import_pipeline_orchestrates_detection_engine_and_parser(monkeypatch):
-    probe_payload = EnginePayload(html='<div class="product-card"><h2>Demo</h2><span class="price">10.00</span></div>')
+    def fake_pw_payload(self, url: str, options=None):
+        return EnginePayload(
+            html="<html><body><div>dynamic page</div></body></html>",
+            final_url=url,
+            api_urls=[f"{url}/api/products"],
+            api_payloads=[{"items": [{"name": "Demo", "price": "10.00", "id": "p1"}]}],
+        )
 
-    def fake_html_scrape(self, url: str, options=None):
-        return probe_payload
-
-    monkeypatch.setattr(HtmlEngine, "scrape", fake_html_scrape)
+    monkeypatch.setattr(PlaywrightEngine, "scrape_payload", fake_pw_payload)
 
     pipeline = ImportPipeline()
 
     result = pipeline.run("https://example.com/category")
-    assert result.engine_used in {"HtmlEngine", "PlaywrightEngine", "ApiEngine"}
+    assert result.engine_used == "PlaywrightEngine"
     assert result.elapsed_ms >= 0
     assert isinstance(result.products, list)
     assert len(result.logs) >= 1
 
 
-def test_import_pipeline_fallbacks_to_playwright_when_html_finds_none(monkeypatch):
-    def fake_html_scrape(self, url: str, options=None):
-        return EnginePayload(html="<html><body><div>no products here</div></body></html>", final_url=url)
-
+def test_import_pipeline_uses_html_as_last_resort(monkeypatch):
     def fake_pw_payload(self, url: str, options=None):
         return EnginePayload(
             html='<div class="product-card"><h2>PW Product</h2><span class="price">19.90</span></div>',
             final_url=url,
             api_payloads=[],
+            discovered_products=[],
         )
 
-    monkeypatch.setattr(HtmlEngine, "scrape", fake_html_scrape)
+    def fake_api_scrape(self, url: str, options=None):
+        return EnginePayload(html="", final_url=url, api_payloads=[], discovered_products=[])
+
     monkeypatch.setattr(PlaywrightEngine, "scrape_payload", fake_pw_payload)
+    monkeypatch.setattr(ApiEngine, "scrape", fake_api_scrape)
 
     pipeline = ImportPipeline()
     result = pipeline.run("https://example.com/category")

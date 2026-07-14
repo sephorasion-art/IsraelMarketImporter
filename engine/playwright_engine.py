@@ -1,18 +1,20 @@
 import asyncio
 import os
-import re
 import tempfile
 import threading
 import time
 
+from engine.api_discovery_engine import ApiDiscoveryEngine
 from engine.base_engine import BaseEngine
 from engine.models import EnginePayload, RuntimeOptions
 
 
 class PlaywrightEngine(BaseEngine):
 
-    def __init__(self, headless: bool = True) -> None:
+    def __init__(self, headless: bool = True, debug: bool = False) -> None:
         self.headless = headless
+        self.debug = debug
+        self.discovery = ApiDiscoveryEngine()
 
     @staticmethod
     def _log(logs: list[str], message: str) -> None:
@@ -175,23 +177,24 @@ class PlaywrightEngine(BaseEngine):
                 break
         return click_count
 
-    @staticmethod
-    def _looks_like_json_api(response) -> bool:
-        try:
-            url = (response.url or "").lower()
-            ctype = (response.headers.get("content-type") or "").lower()
-            if "application/json" in ctype or "text/json" in ctype:
-                return True
-            if any(token in url for token in ["/api/", "graphql", ".json", "?format=json", "ajax", "search"]):
-                return True
-            return False
-        except Exception:
-            return False
-
-    @staticmethod
-    def _looks_like_json_url(url: str) -> bool:
-        u = (url or "").lower()
-        return any(token in u for token in ["/api/", "graphql", ".json", "?format=json", "ajax", "products", "catalog"])
+    def _debug_summary(
+        self,
+        logs: list[str],
+        url: str,
+        api_urls: list[str],
+        json_count: int,
+        products_count: int,
+        elapsed_ms: int,
+    ) -> None:
+        if not self.debug:
+            return
+        logs.append(f"debug.url={url}")
+        logs.append(f"debug.apis_detected={len(api_urls)}")
+        logs.append(f"debug.json_responses={json_count}")
+        logs.append(f"debug.products_found={products_count}")
+        logs.append(f"debug.analysis_ms={elapsed_ms}")
+        for api_url in api_urls[:50]:
+            logs.append(f"debug.api_url={api_url}")
 
     async def _scrape_async_payload(self, url: str, options: RuntimeOptions | None = None) -> EnginePayload:
         options = options or RuntimeOptions()
@@ -200,6 +203,7 @@ class PlaywrightEngine(BaseEngine):
         started_at = time.perf_counter()
         logs: list[str] = []
         network_calls: list[str] = []
+        network_events: list[dict[str, str]] = []
         api_payloads: list[dict | list] = []
         json_tasks: list[asyncio.Task] = []
         json_urls_seen: set[str] = set()
@@ -262,20 +266,41 @@ class PlaywrightEngine(BaseEngine):
                 try:
                     if len(api_payloads) >= 30:
                         return
-                    if self._looks_like_json_api(response):
-                        if response.url in json_urls_seen:
+                    response_url = response.url or ""
+                    resource_type = ""
+                    try:
+                        resource_type = response.request.resource_type or ""
+                    except Exception:
+                        resource_type = ""
+
+                    labels = self.discovery.classify_url(response_url, resource_type)
+                    ctype = (response.headers.get("content-type") or "").lower()
+                    looks_json = "json" in ctype or "graphql" in labels or "json" in labels or "api" in labels
+
+                    if looks_json:
+                        if response_url in json_urls_seen:
                             return
-                        json_urls_seen.add(response.url)
+                        json_urls_seen.add(response_url)
                         data = await response.json()
                         if isinstance(data, (dict, list)):
                             api_payloads.append(data)
-                            self._log(logs, f"json_response_captured={response.url}")
+                            self._log(logs, f"json_response_captured={response_url}")
                 except Exception:
                     return
 
             def on_request(request):
                 try:
-                    network_calls.append(request.url)
+                    request_url = request.url
+                    network_calls.append(request_url)
+                    labels = self.discovery.classify_url(request_url, request.resource_type)
+                    network_events.append(
+                        {
+                            "url": request_url,
+                            "method": request.method,
+                            "resource_type": request.resource_type,
+                            "labels": ",".join(labels),
+                        }
+                    )
                 except Exception:
                     return
 
@@ -320,7 +345,8 @@ class PlaywrightEngine(BaseEngine):
                 if len(api_payloads) >= 10:
                     break
                 try:
-                    if self._looks_like_json_url(req_url) and req_url not in json_urls_seen:
+                    labels = self.discovery.classify_url(req_url, "")
+                    if labels and req_url not in json_urls_seen:
                         resp = await page.request.get(req_url, timeout=5000)
                         ctype = (resp.headers.get("content-type") or "").lower()
                         if "json" in ctype:
@@ -333,8 +359,18 @@ class PlaywrightEngine(BaseEngine):
             title = await page.title()
             html = await page.content()
             final_url = page.url
+            api_urls = self.discovery.discover_api_urls(network_events)
+            discovered_products = self.discovery.discover_products(api_payloads)
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
             self._log(logs, f"analysis_ms={elapsed_ms}")
+            self._debug_summary(
+                logs,
+                url=final_url or url,
+                api_urls=api_urls,
+                json_count=len(api_payloads),
+                products_count=len(discovered_products),
+                elapsed_ms=elapsed_ms,
+            )
 
             await page.close()
             await browser.close()
@@ -345,7 +381,9 @@ class PlaywrightEngine(BaseEngine):
                 final_url=final_url,
                 response_headers={},
                 network_calls=network_calls,
+                api_urls=api_urls,
                 api_payloads=api_payloads,
+                discovered_products=discovered_products,
                 screenshots=screenshots,
                 logs=logs,
                 elapsed_ms=elapsed_ms,
@@ -371,6 +409,8 @@ class PlaywrightEngine(BaseEngine):
 
     def scrape_payload(self, url: str, options: RuntimeOptions | None = None) -> EnginePayload:
         """Typed payload API for new architecture."""
+        if options and options.debug:
+            self.debug = True
         return self._run_async(self._scrape_async_payload, url, options)
 
     def scrape(self, url: str, options: RuntimeOptions | None = None) -> dict:
@@ -381,7 +421,9 @@ class PlaywrightEngine(BaseEngine):
             "html": payload.html,
             "json": payload.api_payloads,
             "network_calls": payload.network_calls,
+            "api_urls": payload.api_urls,
             "api_payloads": payload.api_payloads,
+            "products": [product.model_dump() for product in payload.discovered_products],
             "final_url": payload.final_url,
             "screenshots": payload.screenshots,
             "logs": payload.logs,
