@@ -17,6 +17,21 @@ _image_detector = ImageDetector()
 _link_detector = LinkDetector()
 _product_detector = ProductDetector()
 
+_NOISE_TERMS = [
+    "add to cart",
+    "added successfully",
+    "loading",
+    "veuillez patienter",
+    "ajoute au panier",
+    "ajoutee au panier",
+    "checkout",
+    "panier",
+    "quantity selector",
+]
+
+_NOISE_PATTERN = re.compile("|".join(re.escape(t) for t in _NOISE_TERMS), re.I)
+_QTY_PATTERN = re.compile(r"\b(?:qty|quantity|qte|quantite|x)\s*[:x-]?\s*\d+\b", re.I)
+
 _FIELD_WEIGHTS: dict[str, float] = {
     "title": 0.16,
     "price": 0.15,
@@ -43,11 +58,68 @@ _STRATEGY_RELIABILITY: dict[str, float] = {
 }
 
 
-def _clean_text(value: str | None) -> str:
+def clean_text(value: str | None) -> str:
     if not value:
         return ""
-    text = re.sub(r"\s+", " ", value)
+    text = str(value)
+    text = _NOISE_PATTERN.sub(" ", text)
+    text = _QTY_PATTERN.sub(" ", text)
+    text = re.sub(r"\b\d+\s*(?:pcs?|pieces?|items?)\b", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _clean_text(value: str | None) -> str:
+    return clean_text(value)
+
+
+def detect_title(raw: dict[str, Any], fallback_text: str = "") -> str:
+    for key in ("title", "name", "headline", "displayName", "display_name"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            title = clean_text(value)
+            if title:
+                return title
+    return clean_text(fallback_text)
+
+
+def detect_price(raw: dict[str, Any], fallback_text: str = "") -> float | None:
+    for key in ("price", "currentPrice", "salePrice", "unit_price", "final_price", "amount", "value"):
+        parsed = _parse_price(str(raw.get(key) or ""))
+        if parsed is not None:
+            return parsed
+    for nested_key in ("offers", "pricing", "priceInfo", "price_data"):
+        nested = raw.get(nested_key)
+        if isinstance(nested, dict):
+            for key in ("price", "current", "amount", "value", "salePrice"):
+                parsed = _parse_price(str(nested.get(key) or ""))
+                if parsed is not None:
+                    return parsed
+    return _price_detector.detect_in_text(clean_text(fallback_text))
+
+
+def detect_image(raw: dict[str, Any], base_url: str = "") -> tuple[str, list[str]]:
+    gallery = _collect_images(raw, base_url)
+    return (gallery[0] if gallery else "", gallery)
+
+
+def _sanitize_soup(soup: BeautifulSoup) -> BeautifulSoup:
+    if soup is None:
+        return BeautifulSoup("", "lxml")
+
+    # Remove purely interactive/non-content elements from extraction text.
+    for tag in soup.select("button, form, input, select, textarea, svg, script, noscript"):
+        tag.decompose()
+
+    # Remove hidden/accessibility helper nodes and common cart/quantity widgets.
+    for tag in soup.select(
+        "[hidden], [aria-hidden='true'], [type='hidden'], [style*='display:none'], [style*='visibility:hidden'], "
+        "[class*='quantity' i], [id*='quantity' i], [class*='add-to-cart' i], [id*='add-to-cart' i], [class*='checkout' i], [id*='checkout' i], "
+        "[class*='basket' i], [class*='cart' i], [id*='cart' i]"
+    ):
+        tag.decompose()
+
+    return soup
 
 
 def _parse_price(value: str | None) -> float | None:
@@ -171,12 +243,12 @@ def _normalize_item(raw: dict[str, Any], source: str, base_url: str = "") -> dic
             _first_str(raw, ["keywords", "tags_text"]),
         ]
     )
-    title = _first_str(raw, ["title", "name", "headline", "displayName"])
+    title = detect_title(raw)
     description = _first_str(raw, ["description", "subtitle", "summary"])
     url = _normalize_url(_first_str(raw, ["url", "link", "canonical", "productUrl"]), base_url)
 
-    images = _collect_images(raw, base_url)
-    price = _parse_price(str(raw.get("price") or raw.get("currentPrice") or raw.get("salePrice") or ""))
+    image, images = detect_image(raw, base_url)
+    price = detect_price(raw, fallback_text=description)
     if price is None and description:
         price = _price_detector.detect_in_text(description)
 
@@ -213,10 +285,10 @@ def _normalize_item(raw: dict[str, Any], source: str, base_url: str = "") -> dic
         "price": price,
         "compare_at_price": compare_at_price,
         "currency": _first_str(raw, ["currency", "priceCurrency"]),
-        "image": images[0] if images else "",
+        "image": image,
         "images": images,
         "gallery": images,
-        "description": description,
+        "description": clean_text(description),
         "sku": sku,
         "ean": ean,
         "barcode": ean,
@@ -224,6 +296,7 @@ def _normalize_item(raw: dict[str, Any], source: str, base_url: str = "") -> dic
         "category": category,
         "stock": stock,
         "tags": tags,
+        "weight": _parse_price(str(raw.get("weight") or raw.get("netWeight") or raw.get("grossWeight") or "")),
         "url": url,
         "source": source,
     }
@@ -788,7 +861,7 @@ class UniversalParser:
     def parse(self, html: str, base_url: str = "") -> list[dict[str, Any]]:
         if not html:
             return []
-        soup = BeautifulSoup(html, "lxml")
+        soup = _sanitize_soup(BeautifulSoup(html, "lxml"))
 
         strategy_candidates: list[dict[str, Any]] = []
 
@@ -822,6 +895,11 @@ class UniversalParser:
             confidence, confidence_by_field = _score_item(item, source)
             item["confidence"] = confidence
             item["confidence_by_field"] = confidence_by_field
+            # Keep parser output clean and focused on product fields.
+            item["title"] = clean_text(str(item.get("title") or ""))
+            item["description"] = clean_text(str(item.get("description") or ""))
+            item["sku"] = clean_text(str(item.get("sku") or ""))
+            item["barcode"] = clean_text(str(item.get("barcode") or item.get("ean") or ""))
             scored.append(item)
 
         return _merge_items(scored)
@@ -834,20 +912,18 @@ class UniversalParser:
             image = images[0] if images else ""
             products.append(
                 Product(
-                    title=item.get("title") or "",
-                    description=item.get("description") or "",
+                    title=clean_text(item.get("title") or ""),
+                    description=clean_text(item.get("description") or ""),
                     price=item.get("price"),
                     compare_at_price=item.get("compare_at_price"),
-                    sku=item.get("sku") or "",
-                    barcode=item.get("barcode") or item.get("ean") or "",
-                    brand=item.get("brand") or "",
-                    category=item.get("category") or "",
+                    sku=clean_text(item.get("sku") or ""),
+                    barcode=clean_text(item.get("barcode") or item.get("ean") or ""),
+                    brand=clean_text(item.get("brand") or ""),
+                    category=clean_text(item.get("category") or ""),
+                    weight=item.get("weight") if isinstance(item.get("weight"), (int, float)) else None,
                     image=image,
                     gallery=images,
-                    stock=item.get("stock"),
-                    weight=item.get("weight"),
-                    tags=item.get("tags") or [],
-                    url=item.get("url") or "",
+                    url=clean_text(item.get("url") or ""),
                 )
             )
         return products
