@@ -9,7 +9,21 @@ from engine.image_detector import ImageDetector
 from engine.link_detector import LinkDetector
 from engine.models import Product
 from engine.price_detector import PriceDetector
-from engine.product_detector import ProductDetector
+from engine.product_detector import (
+    ProductDetector,
+    detect_barcode as dom_detect_barcode,
+    detect_brand as dom_detect_brand,
+    detect_category as dom_detect_category,
+    detect_compare_price as dom_detect_compare_price,
+    detect_description as dom_detect_description,
+    detect_gallery as dom_detect_gallery,
+    detect_image as dom_detect_image,
+    detect_price as dom_detect_price,
+    detect_sku as dom_detect_sku,
+    detect_title as dom_detect_title,
+    detect_url as dom_detect_url,
+    detect_weight as dom_detect_weight,
+)
 
 
 _price_detector = PriceDetector()
@@ -81,6 +95,42 @@ def detect_title(raw: dict[str, Any], fallback_text: str = "") -> str:
             if title:
                 return title
     return clean_text(fallback_text)
+
+
+def detect_description(card, page_soup=None):
+    return dom_detect_description(card, page_soup=page_soup)
+
+
+def detect_compare_price(card):
+    return dom_detect_compare_price(card, _price_detector)
+
+
+def detect_gallery(card, base_url: str = ""):
+    return dom_detect_gallery(card, _image_detector, base_url=base_url)
+
+
+def detect_brand(card):
+    return dom_detect_brand(card)
+
+
+def detect_weight(card):
+    return dom_detect_weight(card)
+
+
+def detect_category(card):
+    return dom_detect_category(card)
+
+
+def detect_url(card, base_url: str = ""):
+    return dom_detect_url(card, _link_detector, base_url=base_url)
+
+
+def detect_sku(card):
+    return dom_detect_sku(card)
+
+
+def detect_barcode(card):
+    return dom_detect_barcode(card)
 
 
 def detect_price(raw: dict[str, Any], fallback_text: str = "") -> float | None:
@@ -299,6 +349,8 @@ def _normalize_item(raw: dict[str, Any], source: str, base_url: str = "") -> dic
         "weight": _parse_price(str(raw.get("weight") or raw.get("netWeight") or raw.get("grossWeight") or "")),
         "url": url,
         "source": source,
+        "_field_confidence": raw.get("_field_confidence") if isinstance(raw.get("_field_confidence"), dict) else {},
+        "_field_methods": raw.get("_field_methods") if isinstance(raw.get("_field_methods"), dict) else {},
     }
 
 
@@ -316,10 +368,16 @@ def _score_item(item: dict[str, Any], source: str) -> tuple[float, dict[str, flo
     reliability = _STRATEGY_RELIABILITY.get(source, 0.5)
     denominator = sum(_FIELD_WEIGHTS.values()) or 1.0
     field_scores: dict[str, float] = {}
+    dom_field_conf = item.get("_field_confidence") if isinstance(item.get("_field_confidence"), dict) else {}
     score = 0.0
     for field, weight in _FIELD_WEIGHTS.items():
         present = _has_value(item.get(field))
-        field_score = round(weight * reliability if present else 0.0, 4)
+        dom_hint = float(dom_field_conf.get(field) or 0.0)
+        if dom_hint > 0:
+            rel = max(min(dom_hint, 1.0), reliability * 0.5)
+        else:
+            rel = reliability
+        field_score = round(weight * rel if present else 0.0, 4)
         field_scores[field] = field_score
         score += field_score
     normalized = round(min(score / denominator, 1.0), 4)
@@ -372,9 +430,11 @@ def _merge_items(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "source": [],
             "confidence": 0.0,
             "confidence_by_field": {},
+            "methods_by_field": {},
         }
 
         best_field_score: dict[str, float] = {field: -1.0 for field in _FIELD_WEIGHTS}
+        best_field_method: dict[str, str] = {field: "" for field in _FIELD_WEIGHTS}
         galleries: list[str] = []
         tags: list[str] = []
 
@@ -388,12 +448,14 @@ def _merge_items(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 base["source"].append(source)
 
             field_scores = item.get("confidence_by_field") or {}
+            field_methods = item.get("_field_methods") or {}
             for field in _FIELD_WEIGHTS:
                 candidate_value = item.get(field)
                 candidate_field_score = float(field_scores.get(field) or 0.0)
                 if _has_value(candidate_value) and candidate_field_score >= best_field_score[field]:
                     base[field] = candidate_value
                     best_field_score[field] = candidate_field_score
+                    best_field_method[field] = str(field_methods.get(field) or item.get("source") or "")
 
             for img in item.get("gallery") or []:
                 if img and img not in galleries:
@@ -423,6 +485,7 @@ def _merge_items(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         base["source"] = ",".join(base["source"])
         base["confidence_by_field"] = {k: round(max(v, 0.0), 4) for k, v in best_field_score.items()}
+        base["methods_by_field"] = best_field_method
         merged.append(base)
 
     merged.sort(key=lambda i: float(i.get("confidence") or 0.0), reverse=True)
@@ -853,7 +916,35 @@ def _is_product_like(item: dict[str, Any]) -> bool:
     )
     has_price = _extract_price_from_item(item) is not None
     has_image = bool(_extract_images_from_item(item))
-    return bool(title and (has_price or has_image or sku_like))
+
+    if not title:
+        return False
+
+    if has_price or has_image:
+        return True
+
+    # `productId` and `id` are weak signals on their own: require a specific title
+    # so generic container nodes do not get promoted as products.
+    if sku_like:
+        generic_title = title.lower()
+        generic_tokens = {
+            "product",
+            "products",
+            "item",
+            "items",
+            "catalog",
+            "category",
+            "collection",
+            "shop",
+            "home",
+            "menu",
+        }
+        word_count = len([part for part in generic_title.split() if part])
+        if generic_title in generic_tokens or word_count < 2:
+            return False
+        return True
+
+    return False
 
 
 class UniversalParser:
@@ -916,14 +1007,21 @@ class UniversalParser:
                     description=clean_text(item.get("description") or ""),
                     price=item.get("price"),
                     compare_at_price=item.get("compare_at_price"),
+                    currency=clean_text(item.get("currency") or ""),
                     sku=clean_text(item.get("sku") or ""),
+                    ean=clean_text(item.get("ean") or ""),
                     barcode=clean_text(item.get("barcode") or item.get("ean") or ""),
                     brand=clean_text(item.get("brand") or ""),
                     category=clean_text(item.get("category") or ""),
                     weight=item.get("weight") if isinstance(item.get("weight"), (int, float)) else None,
                     image=image,
                     gallery=images,
+                    stock=item.get("stock") if isinstance(item.get("stock"), int) else None,
+                    tags=item.get("tags") if isinstance(item.get("tags"), list) else [],
                     url=clean_text(item.get("url") or ""),
+                    confidence=float(item.get("confidence")) if isinstance(item.get("confidence"), (int, float)) else None,
+                    confidence_by_field=item.get("confidence_by_field") if isinstance(item.get("confidence_by_field"), dict) else {},
+                    methods_by_field=item.get("methods_by_field") if isinstance(item.get("methods_by_field"), dict) else {},
                 )
             )
         return products
@@ -982,7 +1080,9 @@ class UniversalParser:
                     description=item.get("description") or "",
                     price=item.get("price"),
                     compare_at_price=item.get("compare_at_price"),
+                    currency=item.get("currency") or "",
                     sku=item.get("sku") or "",
+                    ean=item.get("ean") or "",
                     barcode=item.get("barcode") or item.get("ean") or "",
                     brand=item.get("brand") or "",
                     category=item.get("category") or "",
@@ -991,6 +1091,9 @@ class UniversalParser:
                     stock=item.get("stock") if isinstance(item.get("stock"), int) else None,
                     tags=item.get("tags") if isinstance(item.get("tags"), list) else [],
                     url=item.get("url") or "",
+                    confidence=float(item.get("confidence")) if isinstance(item.get("confidence"), (int, float)) else None,
+                    confidence_by_field=item.get("confidence_by_field") if isinstance(item.get("confidence_by_field"), dict) else {},
+                    methods_by_field=item.get("methods_by_field") if isinstance(item.get("methods_by_field"), dict) else {},
                 )
             )
         return products

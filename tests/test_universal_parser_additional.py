@@ -71,6 +71,35 @@ def test_universal_parser_parse_api_payloads_nested_products():
     assert len(products) >= 2
 
 
+def test_universal_parser_rejects_generic_product_id_only_nodes():
+    parser = UniversalParser()
+    payloads = [
+      {
+        "data": {
+          "catalog": {
+            "items": [
+              {
+                "name": "Product",
+                "productId": "generic-1",
+              },
+              {
+                "name": "Real Product",
+                "productId": "real-1",
+                "priceInfo": {"value": "12.50"},
+              },
+            ]
+          }
+        }
+      }
+    ]
+
+    products = parser.parse_api_payloads(payloads)
+    titles = {p.title for p in products}
+
+    assert "Product" not in titles
+    assert "Real Product" in titles
+
+
 def test_universal_parser_extracts_opengraph_and_meta_fields():
     html = '''
     <html><head>
