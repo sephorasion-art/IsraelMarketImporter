@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 jinja2
 requests
 beautifulsoup4
@@ -7,3 +7,5 @@ lxml
 pandas
 openpyxl
 python-multipart
+deep-translator
+pydantic
